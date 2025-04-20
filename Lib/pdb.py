@@ -2526,6 +2526,19 @@ class _RemotePdb(Pdb):
         self._write_failed = False
         super().__init__(**kwargs)
 
+    @staticmethod
+    def protocol_version():
+        # By default, assume a client and server are compatible if they run
+        # the same Python major.minor version. We'll try to keep backwards
+        # compatibility between patch versions of a minor version if possible.
+        # If we do need to change the protocol in a patch version, we'll change
+        # `revision` to the patch version where the protocol changed.
+        # We can ignore compatibility for pre-release versions; sys.remote_exec
+        # can't attach to a pre-release version except from that same version.
+        v = sys.version_info
+        revision = 0
+        return int(f"{v.major:02X}{v.minor:02X}{revision:02X}F0", 16)
+
     def _send(self, **kwargs) -> None:
         json_payload = json.dumps(kwargs)
         try:
@@ -2926,7 +2939,7 @@ class _PdbClient:
             return None
 
 
-def _connect(host, port, frame):
+def _connect(host, port, frame, commands, version):
     with closing(socket.create_connection((host, port))) as conn:
         sockfile = conn.makefile("rwb")
 
@@ -2935,19 +2948,37 @@ def _connect(host, port, frame):
 
     if Pdb._last_pdb_instance is not None:
         remote_pdb.error("Another PDB instance is already attached.")
+    elif version != remote_pdb.protocol_version():
+        remote_pdb.error(
+            f"The remote process is running a Python version that is"
+            f" incompatible with the PDB module of the attaching process."
+            f"\nRemote protocol version:   {remote_pdb.protocol_version():#8X}"
+            f"\nAttacher protocol version: {remote_pdb.protocol_version():#8X}"
+        )
     else:
+        remote_pdb.rcLines.extend(commands)
         remote_pdb.set_trace(frame=frame)
 
 
-def attach(pid):
+def attach(pid, commands=()):
     """Attach to a running process with the given PID."""
     with closing(socket.create_server(("localhost", 0))) as server:
         port = server.getsockname()[1]
 
         with tempfile.NamedTemporaryFile("w", delete_on_close=False) as connect_script:
             connect_script.write(
-                f'import pdb, sys\n'
-                f'pdb._connect("localhost", {port}, sys._getframe().f_back)\n'
+                textwrap.dedent(
+                    f"""
+                    import pdb, sys
+                    pdb._connect(
+                        host="localhost",
+                        port={port},
+                        frame=sys._getframe(1),
+                        commands={json.dumps(commands)!r},
+                        version=_RemotePdb.protocol_version(),
+                    )
+                    """
+                )
             )
             connect_script.close()
             sys.remote_exec(pid, connect_script.name)
@@ -3087,7 +3118,7 @@ def main():
     if opts.pid:
         if opts.module:
             parser.error("argument -m: not allowed with argument --pid")
-        attach(opts.pid)
+        attach(opts.pid, opts.commands)
         return
 
     if opts.module:
