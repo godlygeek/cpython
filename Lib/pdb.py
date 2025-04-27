@@ -2880,6 +2880,16 @@ class _PdbClient:
         self.completion_matches = []
         self.state = "dumb"
         self.write_failed = False
+        self.input_lines = queue.Queue()
+        self.read_thread = threading.Thread(target=self.read_lines)
+        self.read_thread.start()
+
+    def read_lines(self):
+        while True:
+            payload = self.sockfile.readline()
+            self.input_lines.put(payload)
+            if not payload:
+                break
 
     def _ensure_valid_message(self, msg):
         # Ensure the message conforms to our protocol.
@@ -2988,7 +2998,7 @@ class _PdbClient:
         with self.readline_completion(self.complete):
             while not self.write_failed:
                 try:
-                    if not (payload_bytes := self.sockfile.readline()):
+                    if not (payload_bytes := self.input_lines.get()):
                         break
                 except KeyboardInterrupt:
                     self.send_interrupt()
@@ -3072,8 +3082,9 @@ class _PdbClient:
             if self.write_failed:
                 return None
 
-            payload = self.sockfile.readline()
+            payload = self.input_lines.get()
             if not payload:
+                self.input_lines.put(payload)
                 return None
 
             payload = json.loads(payload)
