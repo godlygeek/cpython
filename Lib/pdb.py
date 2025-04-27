@@ -2503,27 +2503,9 @@ def set_trace(*, header=None, commands=None):
 
 # Remote PDB
 
-class _PdbServer(Pdb):
-    def __init__(self, sockfile, owns_sockfile=True, **kwargs):
-        self._owns_sockfile = owns_sockfile
-        self._interact_state = None
+class _SocketManager:
+    def __init__(self, sockfile):
         self._sockfile = sockfile
-        self._command_name_cache = []
-        self._write_failed = False
-        super().__init__(**kwargs)
-
-    @staticmethod
-    def protocol_version():
-        # By default, assume a client and server are compatible if they run
-        # the same Python major.minor version. We'll try to keep backwards
-        # compatibility between patch versions of a minor version if possible.
-        # If we do need to change the protocol in a patch version, we'll change
-        # `revision` to the patch version where the protocol changed.
-        # We can ignore compatibility for pre-release versions; sys.remote_exec
-        # can't attach to a pre-release version except from that same version.
-        v = sys.version_info
-        revision = 0
-        return int(f"{v.major:02X}{v.minor:02X}{revision:02X}F0", 16)
 
     def _ensure_valid_message(self, msg):
         # Ensure the message conforms to our protocol.
@@ -2565,7 +2547,7 @@ class _PdbServer(Pdb):
                     f"PDB message doesn't follow the schema! {msg}"
                 )
 
-    def _send(self, **kwargs):
+    def send(self, **kwargs):
         self._ensure_valid_message(kwargs)
         json_payload = json.dumps(kwargs)
         try:
@@ -2579,21 +2561,54 @@ class _PdbServer(Pdb):
             # return an empty string because the socket may be half-closed.
             self._write_failed = True
 
+    def readline(self):
+        return self._sockfile.readline()
+
+    def close(self):
+        try:
+            self._sockfile.close()
+        except OSError:
+            # close() can fail if the connection was broken unexpectedly.
+            pass
+
+
+class _PdbServer(Pdb):
+    def __init__(self, sockmgr, owns_sockmgr=True, **kwargs):
+        self._owns_sockmgr = owns_sockmgr
+        self._interact_state = None
+        self._sockmgr = sockmgr
+        self._command_name_cache = []
+        self._write_failed = False
+        super().__init__(**kwargs)
+
+    @staticmethod
+    def protocol_version():
+        # By default, assume a client and server are compatible if they run
+        # the same Python major.minor version. We'll try to keep backwards
+        # compatibility between patch versions of a minor version if possible.
+        # If we do need to change the protocol in a patch version, we'll change
+        # `revision` to the patch version where the protocol changed.
+        # We can ignore compatibility for pre-release versions; sys.remote_exec
+        # can't attach to a pre-release version except from that same version.
+        v = sys.version_info
+        revision = 0
+        return int(f"{v.major:02X}{v.minor:02X}{revision:02X}F0", 16)
+
     @typing.override
     def message(self, msg, end="\n"):
-        self._send(message=str(msg) + end, type="info")
+        self._sockmgr.send(message=str(msg) + end, type="info")
 
     @typing.override
     def error(self, msg):
-        self._send(message=str(msg), type="error")
+        self._sockmgr.send(message=str(msg), type="error")
 
     def _get_input(self, prompt, state) -> str:
         # Before displaying a (Pdb) prompt, send the list of PDB commands
         # unless we've already sent an up-to-date list.
         if state == "pdb" and not self._command_name_cache:
             self._command_name_cache = self.completenames("", "", 0, 0)
-            self._send(command_list=self._command_name_cache)
-        self._send(prompt=prompt, state=state)
+            self._sockmgr.send(command_list=self._command_name_cache)
+        self._sockmgr.send(prompt=prompt, state=state)
         return self._read_reply()
 
     def _read_reply(self):
@@ -2603,7 +2618,7 @@ class _PdbServer(Pdb):
             if self._write_failed:
                 raise EOFError
 
-            msg = self._sockfile.readline()
+            msg = self._sockmgr.readline()
             if not msg:
                 raise EOFError
 
@@ -2637,7 +2652,7 @@ class _PdbServer(Pdb):
                     }
                 }:
                     items = self._complete_any(text, line, begidx, endidx)
-                    self._send(completions=items)
+                    self._sockmgr.send(completions=items)
                     continue
             # Valid JSON, but doesn't meet the schema.
             self.error(f"Ignoring invalid message from client: {msg}")
@@ -2697,14 +2712,10 @@ class _PdbServer(Pdb):
     def detach(self):
         # Detach the debugger and close the socket without raising BdbQuit
         self.quitting = False
-        if self._owns_sockfile:
+        if self._owns_sockmgr:
             # Don't try to reuse this instance, it's not valid anymore.
             Pdb._last_pdb_instance = None
-            try:
-                self._sockfile.close()
-            except OSError:
-                # close() can fail if the connection was broken unexpectedly.
-                pass
+            self._sockmgr.close()
 
     def do_debug(self, arg):
         # Clear our cached list of valid commands; the recursive debugger might
@@ -2724,7 +2735,7 @@ class _PdbServer(Pdb):
 
     def do_help(self, arg):
         # Tell the client to render the help, since it might need a pager.
-        self._send(help=arg)
+        self._sockmgr.send(help=arg)
 
     do_h = do_help
 
@@ -2760,7 +2771,7 @@ class _PdbServer(Pdb):
 
     @typing.override
     def _create_recursive_debugger(self):
-        return _PdbServer(self._sockfile, owns_sockfile=False)
+        return _PdbServer(self._sockmgr, owns_sockmgr=False)
 
     @typing.override
     def _prompt_for_confirmation(self, prompt, default):
@@ -3014,10 +3025,10 @@ class _PdbClient:
 
 def _connect(host, port, frame, commands, version):
     with closing(socket.create_connection((host, port))) as conn:
-        sockfile = conn.makefile("rwb")
+        sockmgr = _SocketManager(conn.makefile("rwb"))
 
-    remote_pdb = _PdbServer(sockfile)
-    weakref.finalize(remote_pdb, sockfile.close)
+    remote_pdb = _PdbServer(sockmgr)
+    weakref.finalize(remote_pdb, sockmgr.close)
 
     if Pdb._last_pdb_instance is not None:
         remote_pdb.error("Another PDB instance is already attached.")

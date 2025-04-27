@@ -83,7 +83,8 @@ class RemotePdbTestCase(unittest.TestCase):
 
     def setUp(self):
         self.sockfile = MockSocketFile()
-        self.pdb = _PdbServer(self.sockfile)
+        self.sockmgr = pdb._SocketManager(self.sockfile)
+        self.pdb = _PdbServer(self.sockmgr)
 
         # Mock some Bdb attributes that are lazily created when tracing starts
         self.pdb.botframe = None
