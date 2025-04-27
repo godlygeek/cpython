@@ -2,6 +2,7 @@ import io
 import time
 import json
 import os
+import queue
 import signal
 import socket
 import subprocess
@@ -40,7 +41,7 @@ class MockSocketFile:
     """Mock socket file for testing _PdbServer without actual socket connections."""
 
     def __init__(self):
-        self.input_queue = []
+        self.input_queue = queue.Queue()
         self.output_buffer = []
 
     def write(self, data: bytes) -> None:
@@ -53,17 +54,15 @@ class MockSocketFile:
 
     def readline(self) -> bytes:
         """Read a line from the prepared input queue."""
-        if not self.input_queue:
-            return b""
-        return self.input_queue.pop(0)
+        return self.input_queue.get()
 
     def close(self) -> None:
         """Close the mock socket file."""
-        pass
+        self.input_queue.put(b"")
 
     def add_input(self, data: dict) -> None:
         """Add input that will be returned by readline."""
-        self.input_queue.append(json.dumps(data).encode() + b"\n")
+        self.input_queue.put(json.dumps(data).encode() + b"\n")
 
     def get_output(self) -> List[dict]:
         """Get the output that was written by the object being tested."""
@@ -83,7 +82,13 @@ class RemotePdbTestCase(unittest.TestCase):
 
     def setUp(self):
         self.sockfile = MockSocketFile()
-        self.sockmgr = pdb._SocketManager(self.sockfile)
+        self.sock = unittest.mock.Mock()
+        self.sock.close.return_value = None
+        close = self.sockfile.close
+        self.sock.shutdown.side_effect = lambda how: close()
+        self.sock.makefile.return_value = self.sockfile
+        unittest.mock.seal(self.sock)
+        self.sockmgr = pdb._SocketManager(self.sock)
         self.pdb = _PdbServer(self.sockmgr)
 
         # Mock some Bdb attributes that are lazily created when tracing starts
@@ -104,6 +109,9 @@ class RemotePdbTestCase(unittest.TestCase):
         frame_info.f_code.co_name = "test_function"
 
         self.pdb.curframe = frame_info
+
+    def tearDown(self):
+        self.sockmgr.close()
 
     def test_message_and_error(self):
         """Test message and error methods send correct JSON."""
@@ -218,7 +226,9 @@ class RemotePdbTestCase(unittest.TestCase):
 
     def test_detach(self):
         """Test the detach method."""
+        orig_close = self.sockfile.close
         with unittest.mock.patch.object(self.sockfile, 'close') as mock_close:
+            mock_close.side_effect = orig_close
             self.pdb.detach()
             mock_close.assert_called_once()
             self.assertFalse(self.pdb.quitting)

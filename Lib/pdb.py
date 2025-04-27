@@ -75,6 +75,7 @@ import dis
 import code
 import glob
 import json
+import queue
 import token
 import types
 import codeop
@@ -90,12 +91,14 @@ import tempfile
 import textwrap
 import tokenize
 import itertools
+import threading
 import traceback
 import linecache
 import _colorize
 
 from contextlib import closing
 from contextlib import contextmanager
+from contextlib import suppress
 from rlcompleter import Completer
 from types import CodeType
 from warnings import deprecated
@@ -2504,8 +2507,13 @@ def set_trace(*, header=None, commands=None):
 # Remote PDB
 
 class _SocketManager:
-    def __init__(self, sockfile):
-        self._sockfile = sockfile
+    def __init__(self, sock):
+        weakref.finalize(self, self.close)
+        self._sock = sock
+        self._sockfile = sock.makefile("rwb")
+        self._input_queue = queue.Queue()
+        self._read_thread = threading.Thread(target=self._read_thread_body, daemon=True)
+        self._read_thread.start()
 
     def _ensure_valid_message(self, msg):
         # Ensure the message conforms to our protocol.
@@ -2547,6 +2555,10 @@ class _SocketManager:
                     f"PDB message doesn't follow the schema! {msg}"
                 )
 
+    def _read_thread_body(self):
+        while data := self._sockfile.readline():
+            self._input_queue.put(data)
+
     def send(self, **kwargs):
         self._ensure_valid_message(kwargs)
         json_payload = json.dumps(kwargs)
@@ -2562,14 +2574,23 @@ class _SocketManager:
             self._write_failed = True
 
     def readline(self):
-        return self._sockfile.readline()
+        ret = self._input_queue.get()
+        if not ret:
+            # Don't consume the EOF message; put it back for other readers.
+            self._input_queue.put(ret)
+        return ret
 
     def close(self):
-        try:
+        with suppress(OSError):
+            # shutdown() can fail if the connection is already severed.
+            self._sock.shutdown(socket.SHUT_RDWR)
+        self._sock.close()
+        if self._read_thread is not None:
+            self._read_thread.join()
+            self._read_thread = None
+        with suppress(OSError):
+            # close() can fail if the connection is already severed.
             self._sockfile.close()
-        except OSError:
-            # close() can fail if the connection was broken unexpectedly.
-            pass
 
 
 class _PdbServer(Pdb):
@@ -3024,11 +3045,8 @@ class _PdbClient:
 
 
 def _connect(host, port, frame, commands, version):
-    with closing(socket.create_connection((host, port))) as conn:
-        sockmgr = _SocketManager(conn.makefile("rwb"))
-
+    sockmgr = _SocketManager(socket.create_connection((host, port)))
     remote_pdb = _PdbServer(sockmgr)
-    weakref.finalize(remote_pdb, sockmgr.close)
 
     if Pdb._last_pdb_instance is not None:
         remote_pdb.error("Another PDB instance is already attached.")
