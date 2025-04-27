@@ -335,7 +335,6 @@ class PdbConnectTestCase(unittest.TestCase):
         process = subprocess.Popen(
             [sys.executable, self.script_path],
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
             text=True
         )
 
@@ -364,23 +363,6 @@ class PdbConnectTestCase(unittest.TestCase):
         """Helper to send a command to the debugger."""
         client_file.write(json.dumps({"reply": command}).encode() + b"\n")
         client_file.flush()
-
-    def _send_interrupt(self, pid):
-        """Helper to send an interrupt signal to the debugger."""
-        # with tempfile.NamedTemporaryFile("w", delete_on_close=False) as interrupt_script:
-        interrupt_script = TESTFN + "_interrupt_script.py"
-        with open(interrupt_script, 'w') as f:
-            f.write(
-                'import pdb, sys\n'
-                'print("Hello, world!")\n'
-                'if inst := pdb.Pdb._last_pdb_instance:\n'
-                '    inst.set_trace(sys._getframe(1))\n'
-            )
-        self.addCleanup(unlink, interrupt_script)
-        try:
-            sys.remote_exec(pid, interrupt_script)
-        except PermissionError:
-            self.skipTest("Insufficient permissions to execute code in remote process")
 
     def test_connect_and_basic_commands(self):
         """Test connecting to a remote debugger and sending basic commands."""
@@ -523,8 +505,9 @@ class PdbConnectTestCase(unittest.TestCase):
                 if line.startswith("Iteration"):
                     break
 
-            # Inject a script to interrupt the running process
-            self._send_interrupt(process.pid)
+            # Interrupt the running process
+            client_file.write(json.dumps({"raise_signal": "SIGINT"}).encode() + b"\n")
+            client_file.flush()
             messages = self._read_until_prompt(client_file)
 
             # Verify we got the keyboard interrupt message.

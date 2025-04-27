@@ -2511,6 +2511,7 @@ class _SocketManager:
         weakref.finalize(self, self.close)
         self._sock = sock
         self._sockfile = sock.makefile("rwb")
+        self._send_lock = threading.Lock()
         self._input_queue = queue.Queue()
         self._read_thread = threading.Thread(target=self._read_thread_body, daemon=True)
         self._read_thread.start()
@@ -2556,15 +2557,57 @@ class _SocketManager:
                 )
 
     def _read_thread_body(self):
-        while data := self._sockfile.readline():
-            self._input_queue.put(data)
+        while True:
+            try:
+                data = self._sockfile.readline()
+            except OSError:
+                break
+
+            if data == b"":
+                break
+
+            try:
+                signal_name = json.loads(data)["raise_signal"]
+            except (KeyError, json.JSONDecodeError):
+                # Let the tracing thread handle everything but raise_signal
+                # messages, including malformed payloads.
+                self._input_queue.put(data)
+            else:
+                self._raise_signal(signal_name)
+
+    def _raise_signal(self, signal_name):
+        signal_number = getattr(signal, signal_name, None)
+        if signal_number is None:
+            self.send(
+                message=f"Can't raise unrecognized signal {signal_name}",
+                type="error",
+            )
+            return False
+
+        if hasattr(signal, "pthread_kill") and threading.main_thread().is_alive:
+            main_thread_id = threading.main_thread().ident
+            if main_thread_id is not None:
+                # This can fail if the main thread dies before we get here.
+                with suppress(OSError):
+                    signal.pthread_kill(main_thread_id, signal_number)
+                    return
+
+        # Not Unix, or main thread is done, or the main thread hasn't started
+        try:
+            signal.raise_signal(signal_number)
+        except OSError as exc:
+            self.send(
+                message=f"Can't raise {signal_name} signal: {exc!r}",
+                type="error",
+            )
 
     def send(self, **kwargs):
         self._ensure_valid_message(kwargs)
         json_payload = json.dumps(kwargs)
         try:
-            self._sockfile.write(json_payload.encode() + b"\n")
-            self._sockfile.flush()
+            with self._send_lock:
+                self._sockfile.write(json_payload.encode() + b"\n")
+                self._sockfile.flush()
         except OSError:
             # This means that the client has abruptly disconnected, but we'll
             # handle that the next time we try to read from the client instead
@@ -2829,10 +2872,9 @@ class _PdbServer(Pdb):
 
 
 class _PdbClient:
-    def __init__(self, pid, sockfile, interrupt_script):
+    def __init__(self, pid, sockfile):
         self.pid = pid
         self.sockfile = sockfile
-        self.interrupt_script = interrupt_script
         self.pdb_instance = Pdb()
         self.pdb_commands = set()
         self.completion_matches = []
@@ -2852,6 +2894,13 @@ class _PdbClient:
                 pass
             case {"signal": "INT"}:
                 # Tell the remote PDB that the user pressed ^C at a prompt.
+                pass
+            case {"raise_signal": "SIGINT"}:
+                # Tell the remote PDB that the user wants to interrupt the
+                # execution of the running program by sending a keyboard
+                # interrupt to the main thread. This is different than the
+                # {"signal": "INT"} message above, which is always handled
+                # by the thread that issued the prompt.
                 pass
             case {
                 "complete": {
@@ -2957,11 +3006,7 @@ class _PdbClient:
                 self.process_payload(payload)
 
     def send_interrupt(self):
-        print(
-            "\n*** Program will stop at the next bytecode instruction."
-            " (Use 'cont' to resume)."
-        )
-        sys.remote_exec(self.pid, self.interrupt_script)
+        self._send(raise_signal="SIGINT")
 
     def process_payload(self, payload):
         match payload:
@@ -3094,15 +3139,7 @@ def attach(pid, commands=()):
                 sockfile = client_sock.makefile("rwb")
 
             with closing(sockfile):
-                with tempfile.NamedTemporaryFile("w", delete_on_close=False) as interrupt_script:
-                    interrupt_script.write(
-                        'import pdb, sys\n'
-                        'if inst := pdb.Pdb._last_pdb_instance:\n'
-                        '    inst.set_trace(sys._getframe(1))\n'
-                    )
-                    interrupt_script.close()
-
-                    _PdbClient(pid, sockfile, interrupt_script.name).cmdloop()
+                _PdbClient(pid, sockfile).cmdloop()
 
 
 # Post-Mortem interface
