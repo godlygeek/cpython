@@ -3128,9 +3128,9 @@ def attach(pid, commands=()):
             with closing(client_sock):
                 with tempfile.NamedTemporaryFile("w", delete_on_close=False) as interrupt_script:
                     interrupt_script.write(
-                        'import pdb, sys\n'
-                        'if inst := pdb.Pdb._last_pdb_instance:\n'
-                        '    inst.set_trace(sys._getframe(1))\n'
+                        'import pdb, signal\n'
+                        'if pdb.Pdb._last_pdb_instance:\n'
+                        '    signal.raise_signal(signal.SIGINT)\n'
                     )
                     interrupt_script.close()
 

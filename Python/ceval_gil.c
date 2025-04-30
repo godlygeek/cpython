@@ -1218,12 +1218,12 @@ static inline int run_remote_debugger_source(PyObject *source)
 
 // Note that this function is inline to avoid creating a PLT entry
 // that would be an easy target for a ROP gadget.
-static inline void run_remote_debugger_script(const char *path)
+static inline int run_remote_debugger_script(const char *path)
 {
     if (0 != PySys_Audit("remote_debugger_script", "s", path)) {
         PyErr_FormatUnraisable(
             "Audit hook failed for remote debugger script %s", path);
-        return;
+        return 0;
     }
 
     // Open the debugger script with the open code hook, and reopen the
@@ -1231,7 +1231,7 @@ static inline void run_remote_debugger_script(const char *path)
     PyObject* fileobj = PyFile_OpenCode(path);
     if (!fileobj) {
         PyErr_FormatUnraisable("Can't open debugger script %s", path);
-        return;
+        return 0;
     }
 
     PyObject* source = PyObject_CallMethodNoArgs(fileobj, &_Py_ID(read));
@@ -1247,16 +1247,24 @@ static inline void run_remote_debugger_script(const char *path)
     }
     Py_DECREF(fileobj);
 
+    int ret = 0;
     if (source) {
         if (0 != run_remote_debugger_source(source)) {
-            PyErr_FormatUnraisable("Error executing debugger script %s", path);
+            if (PyErr_ExceptionMatches(PyExc_KeyboardInterrupt)) {
+                ret = -1;
+            } else {
+                PyErr_FormatUnraisable("Error executing debugger script %s", path);
+            }
         }
         Py_DECREF(source);
     }
+
+    return ret;
 }
 
 int _PyRunRemoteDebugger(PyThreadState *tstate)
 {
+    int ret = 0;
     const PyConfig *config = _PyInterpreterState_GetConfig(tstate->interp);
     if (config->remote_debug == 1
          && tstate->remote_debugger_support.debugger_pending_call == 1)
@@ -1278,12 +1286,12 @@ int _PyRunRemoteDebugger(PyThreadState *tstate)
                 pathsz);
             path[pathsz - 1] = '\0';
             if (*path) {
-                run_remote_debugger_script(path);
+                ret = run_remote_debugger_script(path);
             }
             PyMem_Free(path);
         }
     }
-    return 0;
+    return ret;
 }
 
 #endif
@@ -1416,7 +1424,9 @@ _Py_HandlePending(PyThreadState *tstate)
     }
 
 #if defined(Py_REMOTE_DEBUG) && defined(Py_SUPPORTS_REMOTE_DEBUG)
-    _PyRunRemoteDebugger(tstate);
+    if (_PyRunRemoteDebugger(tstate) != 0) {
+        return -1;
+    }
 #endif
 
     return 0;
