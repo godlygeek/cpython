@@ -2903,12 +2903,24 @@ class _PdbClient:
         finally:
             readline.set_completer(old_completer)
 
+    @contextmanager
+    def _sigint_handler(self, handler):
+        old_handler = signal.signal(signal.SIGINT, handler)
+        try:
+            yield
+        finally:
+            signal.signal(signal.SIGINT, old_handler)
+
     def cmdloop(self):
-        with self.readline_completion(self.complete):
+        with (
+            self._sigint_handler(signal.SIG_IGN),
+            self.readline_completion(self.complete),
+        ):
             while not self.write_failed:
                 try:
-                    if not (payload_bytes := self.sockfile.readline()):
-                        break
+                    with self._sigint_handler(signal.default_int_handler):
+                        if not (payload_bytes := self.sockfile.readline()):
+                            break
                 except KeyboardInterrupt:
                     self.send_interrupt()
                     continue
@@ -2955,7 +2967,8 @@ class _PdbClient:
     def prompt_for_reply(self, prompt):
         while True:
             try:
-                payload = {"reply": self.read_command(prompt)}
+                with self._sigint_handler(signal.default_int_handler):
+                    payload = {"reply": self.read_command(prompt)}
             except EOFError:
                 payload = {"signal": "EOF"}
             except KeyboardInterrupt:
@@ -2995,7 +3008,8 @@ class _PdbClient:
             if self.write_failed:
                 return None
 
-            payload = self.sockfile.readline()
+            with self._sigint_handler(signal.default_int_handler):
+                payload = self.sockfile.readline()
             if not payload:
                 return None
 
